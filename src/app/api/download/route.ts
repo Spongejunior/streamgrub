@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 
-const DEMO_CONTENT = 'This is a demo file. In production, this would be the actual downloaded video content.\n';
+const ACTIVE_DOWNLOADS = new Map<string, boolean>();
 
 export async function POST(request: NextRequest) {
   try {
@@ -11,65 +11,127 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
     }
 
-    const ytDlpPath = 'yt-dlp';
-    
-    const args = [
-      '-f', format.format_id || 'best',
-      '-o', '-',
-      '--no-playlist',
-      url
-    ];
+    const downloadId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    ACTIVE_DOWNLOADS.set(downloadId, true);
 
-    const childProcess = spawn(ytDlpPath, args);
-    
-    const chunks: Buffer[] = [];
-    
-    childProcess.stdout.on('data', (data) => {
-      chunks.push(data);
-    });
+    try {
+      const ytDlpPath = 'yt-dlp';
+      
+      let formatArg = format?.format_id || 'best';
+      if (format?.ext === 'mp3' || format?.ext === 'm4a' || format?.ext === 'webm') {
+        formatArg = 'bestaudio/best';
+      }
 
-    let errorMessage = '';
-    childProcess.stderr.on('data', (data) => {
-      errorMessage += data.toString();
-    });
+      const args = [
+        '-f', formatArg,
+        '-o', '-',
+        '--no-playlist',
+        '--no-warnings',
+        '--quiet',
+        url
+      ];
 
-    return new Promise((resolve) => {
-      childProcess.on('close', (code) => {
-        if (code !== 0 && chunks.length === 0) {
-          console.log('yt-dlp not available, using demo mode');
-          const buffer = Buffer.from(DEMO_CONTENT.repeat(500));
-          const headers = new Headers();
-          headers.set('Content-Type', 'application/octet-stream');
-          headers.set('Content-Length', buffer.length.toString());
-          headers.set('Content-Disposition', `attachment; filename="demo_download.${format.ext || 'mp4'}"`);
-          resolve(new NextResponse(buffer, { status: 200, headers }));
-          return;
+      const childProcess = spawn(ytDlpPath, args);
+      let isYtDlpAvailable = true;
+      let stderrData = '';
+
+      childProcess.stderr.on('data', (data) => {
+        stderrData += data.toString();
+        if (data.toString().includes('not found') || data.toString().includes('command not found')) {
+          isYtDlpAvailable = false;
         }
-
-        const buffer = Buffer.concat(chunks);
-        
-        const headers = new Headers();
-        headers.set('Content-Type', 'application/octet-stream');
-        headers.set('Content-Length', buffer.length.toString());
-        headers.set('Content-Disposition', `attachment; filename="download.${format.ext || 'mp4'}"`);
-        
-        resolve(new NextResponse(buffer, { status: 200, headers }));
       });
 
-      childProcess.on('error', (err) => {
-        console.log('yt-dlp not found, using demo mode');
-        const buffer = Buffer.from(DEMO_CONTENT.repeat(500));
-        const headers = new Headers();
-        headers.set('Content-Type', 'application/octet-stream');
-        headers.set('Content-Length', buffer.length.toString());
-        headers.set('Content-Disposition', `attachment; filename="demo_download.${format.ext || 'mp4'}"`);
-        resolve(new NextResponse(buffer, { status: 200, headers }));
+      childProcess.on('error', () => {
+        isYtDlpAvailable = false;
       });
-    });
+
+      const checkTimeout = setTimeout(() => {
+        if (!isYtDlpAvailable) {
+          childProcess.kill();
+        }
+      }, 2000);
+
+      await new Promise<void>((resolve) => {
+        childProcess.on('close', () => {
+          clearTimeout(checkTimeout);
+          resolve();
+        });
+      });
+
+      if (!isYtDlpAvailable || childProcess.killed) {
+        const ext = format?.ext || 'mp4';
+        const demoContent = `Demo content for ${url}\nInstall yt-dlp for real downloads: pip install yt-dlp`;
+        const buffer = Buffer.from(demoContent.repeat(200), 'utf-8');
+        
+        return new NextResponse(buffer, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': buffer.length.toString(),
+            'Content-Disposition': `attachment; filename="download.${ext}"`,
+            'Cache-Control': 'no-cache',
+          }
+        });
+      }
+
+      const stream = new ReadableStream({
+        start(controller) {
+          childProcess.stdout.on('data', (chunk: Buffer) => {
+            if (ACTIVE_DOWNLOADS.has(downloadId)) {
+              controller.enqueue(chunk);
+            }
+          });
+
+          childProcess.on('error', (err) => {
+            console.error('yt-dlp error:', err);
+            controller.error(err);
+          });
+
+          childProcess.on('close', () => {
+            ACTIVE_DOWNLOADS.delete(downloadId);
+            try {
+              controller.close();
+            } catch (e) {}
+          });
+        },
+        cancel() {
+          ACTIVE_DOWNLOADS.delete(downloadId);
+          childProcess.kill();
+        }
+      });
+
+      const ext = format?.ext || 'mp4';
+      const contentType = ext === 'mp3' ? 'audio/mpeg' 
+        : ext === 'm4a' ? 'audio/mp4'
+        : ext === 'webm' ? 'audio/webm'
+        : 'video/mp4';
+
+      return new NextResponse(stream, {
+        status: 200,
+        headers: {
+          'Content-Type': contentType,
+          'Content-Disposition': `attachment; filename="download.${ext}"`,
+          'Cache-Control': 'no-cache',
+          'X-Content-Type-Options': 'nosniff',
+        }
+      });
+
+    } finally {
+      setTimeout(() => ACTIVE_DOWNLOADS.delete(downloadId), 120000);
+    }
+
   } catch (error) {
     console.error('API error:', error);
     return NextResponse.json({ 
       error: 'Internal server error' 
     }, { status: 500 });
   }
+}
+
+export async function GET() {
+  return NextResponse.json({ 
+    active: ACTIVE_DOWNLOADS.size,
+    status: 'ready'
+  });
 }
